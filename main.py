@@ -48,14 +48,14 @@ MAX_POSITIONS     = int(os.environ.get("MAX_POSITIONS",       "6"))
 MAX_EXPOSURE_PCT  = float(os.environ.get("MAX_EXPOSURE_PCT",  "0.80"))
 TRAILING_MA_FAST  = int(os.environ.get("TRAILING_MA_FAST",    "10"))      # 10-EMA
 TRAILING_MA_SLOW  = int(os.environ.get("TRAILING_MA_SLOW",    "20"))      # 20-EMA
-ADR_THRESHOLD     = float(os.environ.get("ADR_THRESHOLD",     "0.024"))   # 2.4%
+ADR_THRESHOLD     = float(os.environ.get("ADR_THRESHOLD",     "0.015"))   # 1.5% (was 2.4%; lowered to allow tight VCP consolidations)
 MIN_DOLLAR_VOLUME = float(os.environ.get("MIN_DOLLAR_VOLUME", "60000000"))
 RS_PERCENTILE     = float(os.environ.get("RS_PERCENTILE",     "0.93"))    # top 7%
 VIX_MAX           = float(os.environ.get("VIX_MAX",           "35"))
 REGIME_SPY_SMA    = int(os.environ.get("REGIME_SPY_SMA",      "50"))
 CONSOL_MIN_DAYS   = int(os.environ.get("CONSOL_MIN_DAYS",     "10"))      # ~2 weeks
 CONSOL_MAX_DAYS   = int(os.environ.get("CONSOL_MAX_DAYS",     "45"))      # ~2 months
-PRIOR_MOVE_MIN    = float(os.environ.get("PRIOR_MOVE_MIN",    "0.30"))    # 30%
+PRIOR_MOVE_MIN    = float(os.environ.get("PRIOR_MOVE_MIN",    "0.20"))    # 20% (was 30%; lowered to catch early-stage momentum)
 PRIOR_MOVE_MONTHS = int(os.environ.get("PRIOR_MOVE_MONTHS",   "3"))       # look back 3 months
 VOLUME_CONFIRM    = float(os.environ.get("VOLUME_CONFIRM",    "1.5"))     # 1.5x avg vol on breakout
 PARTIAL_EXIT_DAYS = int(os.environ.get("PARTIAL_EXIT_DAYS",   "4"))       # sell 1/3 after N days
@@ -579,12 +579,12 @@ def score_consolidation(bars):
     else:
         details["bbw_compressed"] = False
 
-    # 5. Proximity to 10-SMA: within 2%
+    # 5. Proximity to 10-SMA: within 3% (was 2%; widened for tight bases that sit slightly further)
     if len(closes) >= 10:
         sma10 = sum(closes[-10:]) / 10
         if sma10 > 0:
             proximity = abs(closes[-1] - sma10) / closes[-1]
-            near = proximity <= 0.02
+            near = proximity <= 0.03
             if near:
                 score += 1
             details["near_10sma"] = near
@@ -601,15 +601,21 @@ def score_consolidation(bars):
 
     return score, details, consol_high, consol_low
 
-def detect_consolidations(candidates):
+def detect_consolidations(candidates, regime=None):
     """
     For each scanner candidate, fetch recent daily bars and score consolidation.
-    Returns candidates enriched with consolidation data, filtered to score >= 4.
+    Returns candidates enriched with consolidation data, filtered by score.
+    Score threshold: >= 3 in AGGRESSIVE regime, >= 4 otherwise.
     """
     log("INFO", "=== CONSOLIDATION DETECTION ===")
     today = now_et().date()
     end   = today.isoformat()
     start = (today - timedelta(days=90)).isoformat()
+
+    # In AGGRESSIVE regime (post-correction recovery), accept looser consolidations
+    regime_name = regime["regime"] if regime else "FULL_RISK"
+    min_score = 3 if regime_name == "AGGRESSIVE" else 4
+    log("INFO", f"  Consolidation min score: {min_score}/5 (regime={regime_name})")
 
     qualified = []
     for cand in candidates:
@@ -620,8 +626,8 @@ def detect_consolidations(candidates):
                 continue
 
             score, details, consol_high, consol_low = score_consolidation(bars)
-            if score < 4:
-                log("DEBUG", f"  {sym}: consol score {score}/5 — skip")
+            if score < min_score:
+                log("DEBUG", f"  {sym}: consol score {score}/5 — skip (need {min_score})")
                 continue
 
             closes = [b["c"] for b in bars]
@@ -694,8 +700,17 @@ def check_regime():
         sma20  = calc_sma(spy_closes, 20)
         price  = spy_closes[-1]
 
+        # Primary check: golden cross (50 > 200) + price above 50
         spy_ok = (price > sma50 and sma50 > sma200) if sma50 and sma200 else False
-        details.append(f"SPY: {price:.0f} vs 50sma={sma50:.0f} 200sma={sma200:.0f} -> {'OK' if spy_ok else 'FAIL'}")
+        # V-recovery override: in sharp recoveries (e.g. Iran selloff reversal),
+        # price can be above BOTH MAs while 50 SMA still lags below 200 SMA.
+        # If price is above 200 SMA by 3%+ AND above 50 SMA, treat as OK.
+        # This prevents NO_ENTRY blocking during strong V-shaped recoveries.
+        if not spy_ok and sma50 and sma200 and price > sma50 and price > sma200 * 1.03:
+            spy_ok = True
+            details.append(f"SPY: {price:.0f} above both MAs (50sma={sma50:.0f} < 200sma={sma200:.0f} but V-recovery override)")
+        else:
+            details.append(f"SPY: {price:.0f} vs 50sma={sma50:.0f} 200sma={sma200:.0f} -> {'OK' if spy_ok else 'FAIL'}")
 
         # AGGRESSIVE detection: SPY reclaims 20-SMA after a 5%+ pullback
         if sma20 and price > sma20:
@@ -1389,7 +1404,7 @@ def post_close_cycle():
         candidates = nightly_scan()
         # 4. Consolidation scoring
         if candidates:
-            qualified = detect_consolidations(candidates)
+            qualified = detect_consolidations(candidates, regime=regime)
             S.scan_results = qualified
         else:
             S.scan_results = []
@@ -1595,7 +1610,7 @@ def handle_cmd(text, chat_id):
         tg_send("Manual scan triggered...")
         candidates = nightly_scan()
         if candidates:
-            qualified = detect_consolidations(candidates)
+            qualified = detect_consolidations(candidates, regime=S.regime_data)
             S.scan_results = qualified
             msg = f"*Manual Scan*: {len(qualified)} setups\n"
             for c in qualified[:10]:
