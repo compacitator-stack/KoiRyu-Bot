@@ -1,5 +1,6 @@
 // ============================================================
-// GreenClaw + KoiScale + KoiRyu + RossWatcher — Google Apps Script
+// GreenClaw + KoiScale + KoiRyu + GoldenKame + IronTaka + SteelOokami + RossWatcher
+// Unified Google Apps Script — ONE script for ALL bots, each with its own tabs
 // ============================================================
 // SETUP:
 // 1. Open your existing "GreenClaw Trading Log" spreadsheet
@@ -19,10 +20,20 @@ var SHEETS = {
   koi_trades: "KoiScale Trades",
   koi_eod:    "KoiScale Daily P&L",
   koi_summary:"KoiScale Summary",
-  // KoiRyu tabs (new)
+  // KoiRyu tabs
   ryu_trades:  "KoiRyu Trades",
   ryu_daily:   "KoiRyu Daily",
-  ryu_summary: "KoiRyu Summary"
+  ryu_summary: "KoiRyu Summary",
+  // GoldenKame tabs (Faber — monthly tactical allocation)
+  kame_checks:  "GoldenKame Checks",
+  kame_summary: "GoldenKame Summary",
+  // IronTaka tabs (Brandt — classical breakout)
+  taka_signals: "IronTaka Signals",
+  taka_daily:   "IronTaka Daily",
+  taka_summary: "IronTaka Summary",
+  // SteelOokami tabs (Clenow — weekly momentum rotation)
+  ookami_rebal:   "SteelOokami Rebalances",
+  ookami_summary: "SteelOokami Summary"
 };
 
 // ── Entry point ──────────────────────────────────────────────
@@ -31,10 +42,26 @@ function doPost(e) {
     var data = JSON.parse(e.postData.contents);
     var type = data.type || "unknown";
     var bot  = data.bot_version || "";
-    var isKoi = bot.indexOf("KoiScale") !== -1;
-    var isRyu = bot.indexOf("KoiRyu")   !== -1;
+    var isKoi    = bot.indexOf("KoiScale")    !== -1;
+    var isRyu    = bot.indexOf("KoiRyu")      !== -1;
+    var isKame   = bot.indexOf("GoldenKame")  !== -1;
+    var isTaka   = bot.indexOf("IronTaka")    !== -1;
+    var isOokami = bot.indexOf("SteelOokami") !== -1;
 
-    if (isRyu) {
+    if (isKame) {
+      // ── GoldenKame routing ────────────────────────────────
+      if (type === "kame_monthly") { handleKameMonthly(data); }
+      updateKameSummary();
+    } else if (isTaka) {
+      // ── IronTaka routing ──────────────────────────────────
+      if      (type === "taka_signal") { handleTakaSignal(data); }
+      else if (type === "taka_daily")  { handleTakaDaily(data); }
+      updateTakaSummary();
+    } else if (isOokami) {
+      // ── SteelOokami routing ───────────────────────────────
+      if (type === "ookami_weekly") { handleOokamiWeekly(data); }
+      updateOokamiSummary();
+    } else if (isRyu) {
       // ── KoiRyu routing ────────────────────────────────────
       if      (type === "trade_entry")    { handleRyuTradeEntry(data); }
       else if (type === "trade_exit")     { handleRyuTradeExit(data); }
@@ -870,4 +897,268 @@ function formatEODSheet(sheet) {
   else if (pnl < 0) { pnlCell.setBackground("#f4c7c3"); }
   else              { pnlCell.setBackground("#f8f9fa"); }
   [1, 2, 3].forEach(function(c) { sheet.autoResizeColumn(c); });
+}
+
+// ================================================================
+//  GOLDENKAME HANDLERS (Faber — monthly tactical allocation)
+// ================================================================
+
+function handleKameMonthly(d) {
+  var sheet = getOrCreateSheet(SHEETS.kame_checks, [
+    "Date", "Time", "Equity $", "ON Symbols", "CASH Symbols",
+    "Targets (shares)", "Orders Count", "Orders Detail", "Bot Version"
+  ]);
+
+  var targets = d.targets || {};
+  var targetsStr = Object.keys(targets).map(function(k) {
+    return k + ":" + targets[k];
+  }).join(", ");
+
+  var orders = d.orders || [];
+  var ordersStr = orders.map(function(o) {
+    return (o.side || "") + " " + (o.qty || 0) + " " + (o.symbol || "");
+  }).join("; ") || "none";
+
+  sheet.appendRow([
+    formatDate(d.timestamp),
+    formatTime(d.timestamp),
+    d.equity               || 0,
+    (d.on_symbols   || []).join(", "),
+    (d.cash_symbols || []).join(", ") || "(none)",
+    targetsStr,
+    d.orders_count         || 0,
+    ordersStr,
+    d.bot_version          || ""
+  ]);
+
+  var last = sheet.getLastRow();
+  var onCount = (d.on_symbols || []).length;
+  var bg = onCount > 0 ? "#b7e1cd" : "#fce8b2";  // green if any on, yellow if all cash
+  sheet.getRange(last, 1, 1, 9).setBackground(bg);
+  [1, 2, 3, 4, 5].forEach(function(c) { sheet.autoResizeColumn(c); });
+}
+
+function updateKameSummary() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SHEETS.kame_summary);
+  if (!sheet) { sheet = ss.insertSheet(SHEETS.kame_summary); }
+  sheet.clearContents();
+
+  var checks = ss.getSheetByName(SHEETS.kame_checks);
+  var totalChecks = 0, onChecks = 0, cashChecks = 0, lastEquity = 0, lastDate = "";
+  if (checks && checks.getLastRow() > 1) {
+    var data = checks.getRange(2, 1, checks.getLastRow() - 1, 9).getValues();
+    totalChecks = data.length;
+    data.forEach(function(row) {
+      if (String(row[3]) !== "" && String(row[3]).trim() !== "") { onChecks++; }
+      else { cashChecks++; }
+    });
+    var lastRow = data[data.length - 1];
+    lastDate   = lastRow[0];
+    lastEquity = Number(lastRow[2]) || 0;
+  }
+
+  var data = [
+    ["GoldenKame Performance Summary", ""],
+    ["Last updated", new Date().toLocaleString()],
+    ["", ""],
+    ["-- Monthly Checks --", ""],
+    ["Total checks",       totalChecks],
+    ["ON (invested)",      onChecks],
+    ["CASH (defensive)",   cashChecks],
+    ["Last check date",    lastDate],
+    ["Last equity",        "$" + lastEquity.toFixed(2)],
+    ["", ""],
+    ["-- Strategy --", ""],
+    ["Type",               "Monthly-SMA Tactical (Meb Faber)"],
+    ["Universe",           "SPY / QQQ / IWM"],
+    ["Rule",               "Hold if monthly close > 10M SMA"]
+  ];
+  sheet.getRange(1, 1, data.length, 2).setValues(data);
+  sheet.getRange(1, 1, 1, 2).setFontWeight("bold").setFontSize(14);
+  [4, 11].forEach(function(r) { sheet.getRange(r, 1).setFontWeight("bold"); });
+  sheet.setColumnWidth(1, 260);
+  sheet.setColumnWidth(2, 220);
+}
+
+// ================================================================
+//  IRONTAKA HANDLERS (Brandt — classical breakout, long + short)
+// ================================================================
+
+function handleTakaSignal(d) {
+  var sheet = getOrCreateSheet(SHEETS.taka_signals, [
+    "Date", "Time", "Symbol", "Side", "Entry $", "Stop $",
+    "Target $", "Qty", "Risk/Share $", "Bot Version"
+  ]);
+
+  sheet.appendRow([
+    formatDate(d.timestamp),
+    formatTime(d.timestamp),
+    d.symbol          || "",
+    String(d.side || "").toUpperCase(),
+    d.entry           || "",
+    d.stop            || "",
+    d.target          || "",
+    d.qty             || "",
+    d.risk_per_share  || "",
+    d.bot_version     || ""
+  ]);
+
+  var last = sheet.getLastRow();
+  var side = String(d.side || "").toLowerCase();
+  var bg = side === "buy" ? "#b7e1cd" : (side === "sell" ? "#f4c7c3" : "#ffffff");
+  sheet.getRange(last, 1, 1, 10).setBackground(bg);
+  [1, 2, 3, 4].forEach(function(c) { sheet.autoResizeColumn(c); });
+}
+
+function handleTakaDaily(d) {
+  var sheet = getOrCreateSheet(SHEETS.taka_daily, [
+    "Date", "Time", "Equity $", "# Signals", "# Orders",
+    "Open Positions", "Bot Version"
+  ]);
+
+  sheet.appendRow([
+    formatDate(d.timestamp),
+    formatTime(d.timestamp),
+    d.equity          || 0,
+    d.num_signals     || 0,
+    d.num_orders      || 0,
+    d.open_positions  || 0,
+    d.bot_version     || ""
+  ]);
+
+  var last = sheet.getLastRow();
+  var n = Number(d.num_signals) || 0;
+  sheet.getRange(last, 4).setBackground(n > 0 ? "#b7e1cd" : "#f8f9fa");
+  [1, 2, 3].forEach(function(c) { sheet.autoResizeColumn(c); });
+}
+
+function updateTakaSummary() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SHEETS.taka_summary);
+  if (!sheet) { sheet = ss.insertSheet(SHEETS.taka_summary); }
+  sheet.clearContents();
+
+  var sigSheet = ss.getSheetByName(SHEETS.taka_signals);
+  var totalSigs = 0, longSigs = 0, shortSigs = 0;
+  if (sigSheet && sigSheet.getLastRow() > 1) {
+    var sigs = sigSheet.getRange(2, 4, sigSheet.getLastRow() - 1, 1).getValues();
+    totalSigs = sigs.length;
+    sigs.forEach(function(r) {
+      var s = String(r[0]).toUpperCase();
+      if (s === "BUY") { longSigs++; }
+      else if (s === "SELL") { shortSigs++; }
+    });
+  }
+
+  var dailySheet = ss.getSheetByName(SHEETS.taka_daily);
+  var scanDays = 0, lastEquity = 0;
+  if (dailySheet && dailySheet.getLastRow() > 1) {
+    scanDays = dailySheet.getLastRow() - 1;
+    lastEquity = Number(dailySheet.getRange(scanDays + 1, 3).getValue()) || 0;
+  }
+
+  var data = [
+    ["IronTaka Performance Summary", ""],
+    ["Last updated", new Date().toLocaleString()],
+    ["", ""],
+    ["-- Signals --", ""],
+    ["Total signals",      totalSigs],
+    ["Long (buy)",         longSigs],
+    ["Short (sell)",       shortSigs],
+    ["", ""],
+    ["-- Daily Scans --", ""],
+    ["Scan days",          scanDays],
+    ["Last equity",        "$" + lastEquity.toFixed(2)],
+    ["", ""],
+    ["-- Strategy --", ""],
+    ["Type",               "Classical Breakout (Peter Brandt)"],
+    ["Patterns",           "Horizontal channels v0"],
+    ["Sides",              "Long + Short"]
+  ];
+  sheet.getRange(1, 1, data.length, 2).setValues(data);
+  sheet.getRange(1, 1, 1, 2).setFontWeight("bold").setFontSize(14);
+  [4, 9, 13].forEach(function(r) { sheet.getRange(r, 1).setFontWeight("bold"); });
+  sheet.setColumnWidth(1, 260);
+  sheet.setColumnWidth(2, 220);
+}
+
+// ================================================================
+//  STEELOOKAMI HANDLERS (Clenow — weekly momentum rotation)
+// ================================================================
+
+function handleOokamiWeekly(d) {
+  var sheet = getOrCreateSheet(SHEETS.ookami_rebal, [
+    "Date", "Time", "Equity $", "Regime ON", "Universe",
+    "Eligible", "Slots", "Target Set", "# Orders",
+    "Orders Detail", "Bot Version"
+  ]);
+
+  var orders = d.orders || [];
+  var ordersStr = orders.map(function(o) {
+    return (o.side || "") + " " + (o.qty || 0) + " " + (o.symbol || "");
+  }).join("; ") || "none";
+
+  sheet.appendRow([
+    formatDate(d.timestamp),
+    formatTime(d.timestamp),
+    d.equity              || 0,
+    d.regime_on ? "Yes" : "No",
+    d.universe            || 0,
+    d.eligible            || 0,
+    d.slots               || 0,
+    d.target_set          || "",
+    d.orders_count        || 0,
+    ordersStr,
+    d.bot_version         || ""
+  ]);
+
+  var last = sheet.getLastRow();
+  var bg = d.regime_on ? "#b7e1cd" : "#f4c7c3";
+  sheet.getRange(last, 4).setBackground(bg);
+  [1, 2, 3, 4, 7].forEach(function(c) { sheet.autoResizeColumn(c); });
+}
+
+function updateOokamiSummary() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SHEETS.ookami_summary);
+  if (!sheet) { sheet = ss.insertSheet(SHEETS.ookami_summary); }
+  sheet.clearContents();
+
+  var rebSheet = ss.getSheetByName(SHEETS.ookami_rebal);
+  var totalRebs = 0, regimeOnCount = 0, regimeOffCount = 0, lastEquity = 0, lastTargets = "";
+  if (rebSheet && rebSheet.getLastRow() > 1) {
+    var rows = rebSheet.getRange(2, 1, rebSheet.getLastRow() - 1, 11).getValues();
+    totalRebs = rows.length;
+    rows.forEach(function(r) {
+      if (String(r[3]) === "Yes") { regimeOnCount++; }
+      else { regimeOffCount++; }
+    });
+    var lastRow = rows[rows.length - 1];
+    lastEquity  = Number(lastRow[2]) || 0;
+    lastTargets = String(lastRow[7] || "");
+  }
+
+  var data = [
+    ["SteelOokami Performance Summary", ""],
+    ["Last updated", new Date().toLocaleString()],
+    ["", ""],
+    ["-- Rebalances --", ""],
+    ["Total rebalances",   totalRebs],
+    ["Regime ON",          regimeOnCount],
+    ["Regime OFF",         regimeOffCount],
+    ["Last equity",        "$" + lastEquity.toFixed(2)],
+    ["Last target set",    lastTargets.substring(0, 300)],
+    ["", ""],
+    ["-- Strategy --", ""],
+    ["Type",               "Momentum Rotation (Andreas Clenow)"],
+    ["Ranking",            "Slope × R² (90d)"],
+    ["Sizing",             "ATR volatility parity"],
+    ["Regime filter",      "SPY > 200-SMA"]
+  ];
+  sheet.getRange(1, 1, data.length, 2).setValues(data);
+  sheet.getRange(1, 1, 1, 2).setFontWeight("bold").setFontSize(14);
+  [4, 11].forEach(function(r) { sheet.getRange(r, 1).setFontWeight("bold"); });
+  sheet.setColumnWidth(1, 260);
+  sheet.setColumnWidth(2, 320);
 }
