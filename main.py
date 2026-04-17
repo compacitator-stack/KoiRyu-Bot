@@ -503,8 +503,8 @@ def find_consolidation_range(bars):
     if not highs or not lows:
         return None
 
-    consol_high = max(highs[-CONSOL_MIN_DAYS:])
-    consol_low  = min(lows[-CONSOL_MIN_DAYS:])
+    consol_high = max(highs)
+    consol_low  = min(lows)
     consol_days = len(recent)
 
     # The consolidation range should be reasonably tight
@@ -728,7 +728,7 @@ def check_regime():
         details.append("SPY: insufficient data")
 
     # QQQ check
-    qqq_bars = fetch_index_data("QQQ", 60)
+    qqq_bars = fetch_index_data("QQQ", 80)
     qqq_ok = False
     if qqq_bars and len(qqq_bars) >= 50:
         qqq_closes = [b["c"] for b in qqq_bars]
@@ -835,7 +835,6 @@ class BotState:
         self.regime_data = {}
         self.consecutive_losses = 0
         self.scan_results = []
-        self.today_date = ""
         self.offset = 0           # Telegram offset
         self.last_scan_date = ""
         self.last_morning_date = ""
@@ -900,12 +899,20 @@ def calc_position_size(equity, entry, stop, risk_pct):
     return min(shares, max_shares) if max_shares > 0 else shares
 
 def current_exposure(equity):
-    """Total exposure as fraction of equity across all positions."""
+    """Total exposure as fraction of equity across all positions (using current market value)."""
     if equity <= 0:
         return 0
     total = 0
     for sym, pos in S.positions.items():
-        total += pos.get("shares", 0) * pos.get("entry", 0)
+        shares = pos.get("shares", 0)
+        # M6: Use current market price from Alpaca position if available
+        if not DRY_RUN:
+            broker_pos = alp_get(f"/v2/positions/{sym}")
+            if broker_pos and broker_pos.get("current_price"):
+                total += shares * float(broker_pos["current_price"])
+                continue
+        # Fallback to entry price
+        total += shares * pos.get("entry", 0)
     return total / equity
 
 def place_buy_stop(sym, qty, stop_price, limit_price, stop_loss_price):
@@ -1019,6 +1026,24 @@ def manage_positions():
             today_close = today_bar["c"]
             today_high  = today_bar["h"]
 
+            # C5: Deferred volume confirmation for new fills
+            if pos.get("needs_volume_check"):
+                breakout_vol = today_bar.get("v", 0)
+                avg_vol = pos.get("avg_vol_prior", 0)
+                if avg_vol > 0 and breakout_vol < avg_vol * VOLUME_CONFIRM:
+                    log("WARN", f"    {sym}: weak breakout volume ({breakout_vol:.0f} < {avg_vol*VOLUME_CONFIRM:.0f}) — QUEUE SELL")
+                    S.pending_sells.append({
+                        "sym": sym, "reason": "weak breakout volume",
+                        "shares": pos.get("shares", 0)
+                    })
+                    pos.pop("needs_volume_check", None)
+                    S.positions[sym] = pos
+                    continue
+                else:
+                    log("INFO", f"    {sym}: volume confirmed ({breakout_vol:.0f} vs avg {avg_vol:.0f})")
+                pos.pop("needs_volume_check", None)
+                pos.pop("avg_vol_prior", None)
+
             # Update highest high
             if today_high > pos.get("highest_high", 0):
                 pos["highest_high"] = today_high
@@ -1085,8 +1110,36 @@ def manage_positions():
                 })
                 pos["partial_taken"] = True
                 # After partial: move stop to breakeven
-                pos["stop"] = pos.get("entry", pos.get("stop", 0))
+                new_stop = pos.get("entry", pos.get("stop", 0))
+                pos["stop"] = new_stop
                 log("INFO", f"    {sym}: stop moved to breakeven {pos['stop']:.2f}")
+
+                # C3: Cancel old OTO stop-loss and place new one at breakeven
+                remaining_shares = pos.get("shares", 0) - partial_shares
+                if remaining_shares > 0 and not DRY_RUN:
+                    # Find and cancel existing stop-loss order for this symbol
+                    open_orders = get_orders("open")
+                    for o in open_orders:
+                        if (o.get("symbol") == sym and o.get("side") == "sell"
+                                and o.get("type") == "stop"):
+                            cancel_order(o["id"])
+                            log("INFO", f"    {sym}: cancelled old stop order {o['id']}")
+                            break
+                    # Place new stop at breakeven with remaining shares
+                    sl_order = {
+                        "symbol":        sym,
+                        "qty":           str(remaining_shares),
+                        "side":          "sell",
+                        "type":          "stop",
+                        "time_in_force": "gtc",
+                        "stop_price":    str(round(new_stop, 2)),
+                    }
+                    sl_resp = alp_post("/v2/orders", sl_order)
+                    if sl_resp and sl_resp.get("id"):
+                        log("INFO", f"    {sym}: new BE stop placed for {remaining_shares}sh @ ${new_stop:.2f}")
+                    else:
+                        log("ERROR", f"    {sym}: FAILED to place new BE stop — {sl_resp}")
+                        tg_send(f"🚨 *{sym}* BE stop order failed — position unprotected!")
 
             S.positions[sym] = pos
         except Exception as e:
@@ -1208,11 +1261,17 @@ def morning_fill_check():
 
         resp = place_market_sell(sym, shares)
 
+        # C4: If sell order failed, don't remove position — retry next cycle
+        if not resp or not resp.get("id"):
+            log("ERROR", f"  {sym}: sell order FAILED — keeping position tracked for retry")
+            tg_send(f"🚨 *{sym}* sell order failed ({reason}) — will retry next morning")
+            continue
+
         # Track P&L — try to get actual fill price from Alpaca order response
         pos = S.positions.get(sym, {})
         entry = pos.get("entry", 0)
         exit_price = entry  # fallback
-        if resp and resp.get("id") and not resp.get("id", "").startswith("dry_"):
+        if resp.get("id") and not resp.get("id", "").startswith("dry_"):
             # Wait briefly for fill, then check order status
             time.sleep(2)
             order_check = alp_get(f"/v2/orders/{resp['id']}")
@@ -1303,34 +1362,27 @@ def morning_fill_check():
         if not order_resp:
             continue
         status = order_resp.get("status", "")
-        if status == "filled":
+        if status in ("filled", "partially_filled"):
             fill_price = float(order_resp.get("filled_avg_price", buy["entry"]))
-            fill_qty   = int(order_resp.get("filled_qty", buy["shares"]))
+            fill_qty   = int(float(order_resp.get("filled_qty", buy["shares"])))
+            if fill_qty <= 0:
+                log("WARN", f"  {sym}: status={status} but filled_qty=0 — skipping")
+                continue
+            if status == "partially_filled":
+                log("WARN", f"  {sym}: PARTIAL FILL — {fill_qty}/{buy['shares']} shares")
+                tg_send(f"⚠️ *{sym}* partial fill: {fill_qty}/{buy['shares']} shares")
             log("INFO", f"  FILLED: {sym} x{fill_qty} @ {fill_price:.2f}")
 
-            # Volume confirmation: check if breakout day volume >= 1.5x avg
-            # At 09:35 ET, today's bar is incomplete (only 5 min of data).
-            # The buy-stop triggers intraday, so we check yesterday's COMPLETED
-            # daily bar if the order was placed yesterday, or defer volume check
-            # to the next post-close cycle if filled today.
+            # C5: Volume confirmation deferred — at 09:35 the breakout day
+            # (today) has only ~5 min of data so the daily bar is incomplete.
+            # Flag the position for volume check at next post-close cycle
+            # when today's full daily bar is available.
+            # Pre-fetch avg volume from prior days for the deferred check.
             yesterday = (today - timedelta(days=1)).isoformat()
             bars = poly_daily_bars(sym, (today - timedelta(days=25)).isoformat(), yesterday, limit=25)
+            avg_vol = 0
             if bars and len(bars) >= 2:
-                breakout_vol = bars[-1].get("v", 0)  # yesterday = the breakout day
-                avg_vol = sum(b.get("v", 0) for b in bars[:-1]) / max(1, len(bars) - 1)
-                if avg_vol > 0 and breakout_vol < avg_vol * VOLUME_CONFIRM:
-                    log("WARN", f"    {sym}: weak breakout volume ({breakout_vol:.0f} < {avg_vol*VOLUME_CONFIRM:.0f}) — CLOSING")
-                    close_position(sym)
-                    sheets_push({
-                        "type":   "trade_exit",
-                        "symbol": sym,
-                        "entry":  fill_price,
-                        "exit":   fill_price,
-                        "shares": fill_qty,
-                        "pnl":    0,
-                        "exit_reason": "weak breakout volume",
-                    })
-                    continue
+                avg_vol = sum(b.get("v", 0) for b in bars) / max(1, len(bars))
 
             # Track new position
             adr = calc_adr_pct(bars[-20:]) if bars and len(bars) >= 20 else 0.03
@@ -1346,6 +1398,8 @@ def morning_fill_check():
                 "adr_pct":       adr,
                 "consol_score":  buy.get("score", 0),
                 "days_since_new_high": 0,
+                "needs_volume_check": True,
+                "avg_vol_prior":  avg_vol,
             }
 
             sheets_push({
@@ -1528,6 +1582,8 @@ def weekly_digest():
         tg_send(msg)
         sheets_push({"type": "weekly_digest", "date": today.isoformat(),
                      "trades": 0, "note": "no trades"})
+        S.last_weekly_date = today.isoformat()
+        S.save()
         return
 
     wins   = [t for t in week_trades if t["pnl"] > 0]
@@ -1578,13 +1634,18 @@ def weekly_digest():
     log("INFO", "Weekly digest sent")
 
 def is_market_day():
-    """Check if today is a market day (Mon-Fri, not a major holiday)."""
+    """Check if today is a market day using Alpaca trading calendar."""
     now = now_et()
-    if now.weekday() >= 5:  # Sat/Sun
+    if now.weekday() >= 5:  # Sat/Sun — quick check before API call
         return False
-    # Major US holidays — simplified check
-    # Full holiday calendar would use Alpaca /v2/calendar
-    return True
+    today_str = now.date().isoformat()
+    try:
+        cal = alp_get(f"/v2/calendar?start={today_str}&end={today_str}")
+        if cal and len(cal) > 0:
+            return cal[0].get("date", "") == today_str
+        return False  # empty calendar = not a trading day
+    except Exception:
+        return True  # if API fails, assume market day to avoid missed cycles
 
 def handle_cmd(text, chat_id):
     """Handle Telegram commands."""
@@ -1676,6 +1737,33 @@ def startup():
 
     tg_send(f"*KoiRyu v1 started*\n"
             f"DRY_RUN={DRY_RUN} | Positions: {len(S.positions)} | Regime: {S.regime}")
+
+    # C1: Reconcile local state against Alpaca broker positions
+    try:
+        broker_positions = get_positions()
+        broker_syms = {p.get("symbol", ""): p for p in broker_positions} if broker_positions else {}
+        local_syms = set(S.positions.keys())
+
+        # Warn about positions in Alpaca that KoiRyu doesn't track
+        orphaned = set(broker_syms.keys()) - local_syms
+        if orphaned:
+            orphan_detail = ", ".join(f"{s} ({abs(int(float(broker_syms[s].get('qty', 0))))}sh)"
+                                      for s in orphaned)
+            log("WARN", f"ORPHANED POSITIONS (in Alpaca, not tracked by KoiRyu): {orphan_detail}")
+            tg_send(f"⚠️ *Orphaned positions on startup*\n{orphan_detail}\n"
+                    f"Not managed by KoiRyu — check manually.")
+
+        # Warn about positions KoiRyu tracks but Alpaca doesn't have
+        missing = local_syms - set(broker_syms.keys())
+        if missing and not DRY_RUN:
+            log("WARN", f"STALE POSITIONS (tracked by KoiRyu but not in Alpaca): {missing}")
+            for sym in missing:
+                del S.positions[sym]
+            tg_send(f"⚠️ *Stale positions removed*: {', '.join(missing)}\n"
+                    f"Were in KoiRyu state but not in Alpaca.")
+            S.save()
+    except Exception as e:
+        log("DEBUG", f"Startup reconciliation check failed: {e}")
 
 # ── Dashboard HTTP server ─────────────────────────────────────────────────────
 DASHBOARD_PORT = int(os.environ.get("PORT") or os.environ.get("DASHBOARD_PORT", "8080"))
